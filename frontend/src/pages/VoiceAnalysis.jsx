@@ -137,19 +137,29 @@ const VoiceAnalysis = () => {
             }
 
             await loadAnalyses();
-        } catch (err) {
-            console.error("VOICE ANALYSIS ERROR:", err);
+        }  catch (err) {
+    const responseData = err.response?.data;
 
-            setError(
-                err.response?.data?.message ||
-                err.message ||
-                "Voice analysis failed. Please try again."
-            );
+    const serverMessage =
+        responseData?.details ||
+        responseData?.error ||
+        responseData?.message ||
+        err.message ||
+        "Voice analysis failed. Please try again.";
 
-            await loadAnalyses();
-        } finally {
-            setLoading(false);
-        }
+    console.error("VOICE ANALYSIS ERROR:", {
+        status: err.response?.status,
+        data: responseData,
+        url: err.config?.url
+    });
+
+    setError(serverMessage);
+    setMessage("");
+
+    await loadAnalyses();
+} finally {
+    setLoading(false);
+} 
     };
 
     const riskScore = Number(result?.riskScore);

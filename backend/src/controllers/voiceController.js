@@ -1,9 +1,91 @@
-
 import VoiceAnalysis from "../models/VoiceAnalysis.js";
-import fs from "fs";
-import { spawn } from "child_process";
-import path from "path";
 import FraudAlert from "../models/FraudAlert.js";
+import fs from "fs";
+import path from "path";
+import { spawn } from "child_process";
+
+const pythonCommand = process.env.PYTHON_BIN || "python3";
+
+const processorPath = path.resolve(
+    process.cwd(),
+    "audio-processor",
+    "processor.py"
+);
+
+const mlScriptPath = path.resolve(
+    process.cwd(),
+    "..",
+    "ml",
+    "scripts",
+    "predict_voice.py"
+);
+
+const runPythonScript = (scriptPath, audioPath, label) => {
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(scriptPath)) {
+            return reject(
+                new Error(`${label} script not found: ${scriptPath}`)
+            );
+        }
+
+        if (!fs.existsSync(audioPath)) {
+            return reject(
+                new Error(`Audio file not found: ${audioPath}`)
+            );
+        }
+
+        const pythonProcess = spawn(
+            pythonCommand,
+            [scriptPath, audioPath],
+            { windowsHide: true }
+        );
+
+        let output = "";
+        let errorOutput = "";
+
+        pythonProcess.stdout.on("data", (data) => {
+            output += data.toString();
+        });
+
+        pythonProcess.stderr.on("data", (data) => {
+            errorOutput += data.toString();
+        });
+
+        pythonProcess.on("error", (error) => {
+            reject(
+                new Error(
+                    `${label} could not start: ${error.message}`
+                )
+            );
+        });
+
+        pythonProcess.on("close", (code) => {
+            if (code !== 0) {
+                return reject(
+                    new Error(
+                        `${label} failed with exit code ${code}: ${
+                            errorOutput.trim() ||
+                            output.trim() ||
+                            "Unknown Python error"
+                        }`
+                    )
+                );
+            }
+
+            resolve(output.trim());
+        });
+    });
+};
+
+const parsePythonJson = (output, label) => {
+    try {
+        return JSON.parse(output);
+    } catch {
+        throw new Error(
+            `${label} returned invalid JSON: ${output}`
+        );
+    }
+};
 
 // ==========================================
 // UPLOAD VOICE
@@ -48,7 +130,8 @@ export const uploadVoice = async (req, res) => {
 
         return res.status(500).json({
             success: false,
-            message: "Voice upload failed"
+            message: "Voice upload failed",
+            details: error.message
         });
     }
 };
@@ -73,7 +156,8 @@ export const getVoiceAnalyses = async (req, res) => {
 
         return res.status(500).json({
             success: false,
-            message: "Server error"
+            message: "Server error",
+            details: error.message
         });
     }
 };
@@ -83,8 +167,10 @@ export const getVoiceAnalyses = async (req, res) => {
 // ==========================================
 
 export const analyzeVoice = async (req, res) => {
+    let analysis;
+
     try {
-        const analysis = await VoiceAnalysis.findOne({
+        analysis = await VoiceAnalysis.findOne({
             _id: req.params.id,
             user: req.user.userId
         });
@@ -106,284 +192,155 @@ export const analyzeVoice = async (req, res) => {
         analysis.status = "processing";
         await analysis.save();
 
-        // ----------------------------------
-        // AUDIO PROCESSOR
-        // ----------------------------------
+        const audioPath = path.isAbsolute(analysis.filePath)
+            ? analysis.filePath
+            : path.resolve(process.cwd(), analysis.filePath);
 
-        const processorPath = path.resolve(
-            "audio-processor",
-            "processor.py"
+        console.log("CURRENT DIRECTORY:", process.cwd());
+        console.log("PROCESSOR PATH:", processorPath);
+        console.log("PROCESSOR EXISTS:", fs.existsSync(processorPath));
+        console.log("ML SCRIPT PATH:", mlScriptPath);
+        console.log("ML SCRIPT EXISTS:", fs.existsSync(mlScriptPath));
+        console.log("AUDIO PATH:", audioPath);
+        console.log("AUDIO EXISTS:", fs.existsSync(audioPath));
+
+        // Audio processing
+        const audioOutput = await runPythonScript(
+            processorPath,
+            audioPath,
+            "Audio processor"
         );
 
-        const pythonProcess = spawn("python", [
-            processorPath,
-            analysis.filePath
-        ]);
+        const audioResult = parsePythonJson(
+            audioOutput,
+            "Audio processor"
+        );
 
-        let output = "";
-        let errorOutput = "";
+        if (!audioResult.success) {
+            throw new Error(
+                audioResult.message || "Audio processing failed"
+            );
+        }
 
-        pythonProcess.stdout.on("data", (data) => {
-            output += data.toString();
-        });
+        analysis.audioFeatures = audioResult.audio;
 
-        pythonProcess.stderr.on("data", (data) => {
-            errorOutput += data.toString();
-        });
+        // ML prediction
+        const mlOutput = await runPythonScript(
+            mlScriptPath,
+            audioPath,
+            "ML prediction"
+        );
 
-        pythonProcess.on("error", async (error) => {
-            console.error("PYTHON SPAWN ERROR:", error);
+        const mlResult = parsePythonJson(
+            mlOutput,
+            "ML prediction"
+        );
 
-            analysis.status = "failed";
-            await analysis.save();
+        if (!mlResult.success || !mlResult.result) {
+            throw new Error(
+                mlResult.message || "Invalid ML result"
+            );
+        }
 
-            if (!res.headersSent) {
-                res.status(500).json({
-                    success: false,
-                    message: "Could not start Python audio processor"
-                });
-            }
-        });
+        const prediction = mlResult.result;
+        const riskScore = Number(prediction.riskScore);
+        const verdict = prediction.verdict;
 
-        pythonProcess.on("close", async (code) => {
+        if (
+            !Number.isFinite(riskScore) ||
+            riskScore < 0 ||
+            riskScore > 100 ||
+            !["legitimate", "suspicious", "fraud"].includes(verdict)
+        ) {
+            throw new Error(
+                "ML returned an invalid risk score or verdict"
+            );
+        }
+
+        analysis.riskScore = riskScore;
+        analysis.verdict = verdict;
+        analysis.status = "completed";
+
+        await analysis.save();
+
+        let alert = null;
+
+        if (
+            verdict === "suspicious" ||
+            verdict === "fraud"
+        ) {
             try {
-                if (code !== 0) {
-                    console.error("PYTHON PROCESS ERROR:", errorOutput);
+                let severity;
+                let reason;
+                let recommendedAction;
 
-                    analysis.status = "failed";
-                    await analysis.save();
-
-                    return res.status(500).json({
-                        success: false,
-                        message: "Audio processing failed"
-                    });
+                if (riskScore >= 85) {
+                    severity = "critical";
+                    reason =
+                        "Very high probability of synthetic or cloned voice detected.";
+                    recommendedAction =
+                        "Pause high-value transaction and require secondary authentication.";
+                } else if (riskScore >= 75) {
+                    severity = "high";
+                    reason =
+                        "High probability of synthetic or cloned voice detected.";
+                    recommendedAction =
+                        "Require secondary authentication before approving the transaction.";
+                } else {
+                    severity = "medium";
+                    reason =
+                        "Voice characteristics show suspicious synthetic-voice patterns.";
+                    recommendedAction =
+                        "Perform additional verification before proceeding.";
                 }
 
-                // ----------------------------------
-                // PARSE AUDIO FEATURES
-                // ----------------------------------
-
-                const result = JSON.parse(output);
-
-                if (!result.success) {
-                    analysis.status = "failed";
-                    await analysis.save();
-
-                    return res.status(500).json({
-                        success: false,
-                        message: result.message || "Audio processing failed"
-                    });
-                }
-
-                analysis.audioFeatures = result.audio;
-
-                // ----------------------------------
-                // ML PREDICTION
-                // ----------------------------------
-
-                const mlScriptPath = path.resolve(
-                    "..",
-                    "ml",
-                    "scripts",
-                    "predict_voice.py"
+                alert = await FraudAlert.create({
+                    user: req.user.userId,
+                    voiceAnalysis: analysis._id,
+                    riskScore,
+                    severity,
+                    reason,
+                    recommendedAction
+                });
+            } catch (alertError) {
+                console.error(
+                    "FRAUD ALERT CREATION ERROR:",
+                    alertError
                 );
-
-                const mlProcess = spawn("python", [
-                    mlScriptPath,
-                    analysis.filePath
-                ]);
-
-                let mlOutput = "";
-                let mlError = "";
-
-                mlProcess.stdout.on("data", (data) => {
-                    mlOutput += data.toString();
-                });
-
-                mlProcess.stderr.on("data", (data) => {
-                    mlError += data.toString();
-                });
-
-                mlProcess.on("error", async (error) => {
-                    console.error("ML SPAWN ERROR:", error);
-
-                    analysis.status = "failed";
-                    await analysis.save();
-
-                    if (!res.headersSent) {
-                        res.status(500).json({
-                            success: false,
-                            message: "Could not start ML prediction"
-                        });
-                    }
-                });
-
-                mlProcess.on("close", async (mlCode) => {
-                    try {
-                        if (mlCode !== 0) {
-                            console.error("ML PROCESS ERROR:", mlError);
-
-                            analysis.status = "failed";
-                            await analysis.save();
-
-                            return res.status(500).json({
-                                success: false,
-                                message: "ML prediction failed"
-                            });
-                        }
-
-                        // ----------------------------------
-                        // PARSE ML RESULT
-                        // ----------------------------------
-
-                        const mlResult = JSON.parse(mlOutput);
-
-                        if (!mlResult.success || !mlResult.result) {
-                            analysis.status = "failed";
-                            await analysis.save();
-
-                            return res.status(500).json({
-                                success: false,
-                                message: mlResult.message || "Invalid ML result"
-                            });
-                        }
-
-                        const prediction = mlResult.result;
-                        const riskScore = Number(prediction.riskScore);
-                        const verdict = prediction.verdict;
-
-                        if (
-                            !Number.isFinite(riskScore) ||
-                            riskScore < 0 ||
-                            riskScore > 100 ||
-                            !["legitimate", "suspicious", "fraud"].includes(verdict)
-                        ) {
-                            analysis.status = "failed";
-                            await analysis.save();
-
-                            return res.status(500).json({
-                                success: false,
-                                message: "ML returned an invalid risk score or verdict"
-                            });
-                        }
-
-                        // ----------------------------------
-                        // SAVE PREDICTION
-                        // ----------------------------------
-
-                        analysis.riskScore = riskScore;
-                        analysis.verdict = verdict;
-                        analysis.status = "completed";
-
-                        await analysis.save();
-
-                        // ----------------------------------
-                        // FRAUD ALERT GENERATION
-                        // IMPORTANT: Keep this INSIDE
-                        // the ML close callback.
-                        // ----------------------------------
-
-                        let alert = null;
-
-                        if (
-                            verdict === "suspicious" ||
-                            verdict === "fraud"
-                        ) {
-                            let severity;
-                            let reason;
-                            let recommendedAction;
-
-                            if (riskScore >= 85) {
-                                severity = "critical";
-
-                                reason =
-                                    "Very high probability of synthetic or cloned voice detected.";
-
-                                recommendedAction =
-                                    "Pause high-value transaction and require secondary authentication.";
-                            } else if (riskScore >= 75) {
-                                severity = "high";
-
-                                reason =
-                                    "High probability of synthetic or cloned voice detected.";
-
-                                recommendedAction =
-                                    "Require secondary authentication before approving the transaction.";
-                            } else {
-                                severity = "medium";
-
-                                reason =
-                                    "Voice characteristics show suspicious synthetic-voice patterns.";
-
-                                recommendedAction =
-                                    "Perform additional verification before proceeding.";
-                            }
-
-                            alert = await FraudAlert.create({
-                                user: req.user.userId,
-                                voiceAnalysis: analysis._id,
-                                riskScore,
-                                severity,
-                                reason,
-                                recommendedAction
-                            });
-                        }
-
-                        // ----------------------------------
-                        // FINAL RESPONSE
-                        // ----------------------------------
-
-                        return res.status(200).json({
-                            success: true,
-                            message: "Voice analyzed successfully",
-                            analysis: {
-                                id: analysis._id,
-                                filename: analysis.filename,
-                                status: analysis.status,
-                                riskScore: analysis.riskScore,
-                                verdict: analysis.verdict,
-                                audioFeatures: analysis.audioFeatures
-                            },
-                            alertCreated: Boolean(alert)
-                        });
-                    } catch (error) {
-                        console.error("ML OUTPUT ERROR:", error);
-
-                        if (analysis.status === "processing") {
-                            analysis.status = "failed";
-                            await analysis.save();
-                        }
-
-                        if (!res.headersSent) {
-                            return res.status(500).json({
-                                success: false,
-                                message: "ML prediction or fraud alert processing failed"
-                            });
-                        }
-                    }
-                });
-            } catch (error) {
-                console.error("AUDIO OUTPUT ERROR:", error);
-
-                analysis.status = "failed";
-                await analysis.save();
-
-                if (!res.headersSent) {
-                    return res.status(500).json({
-                        success: false,
-                        message: "Invalid audio processor response"
-                    });
-                }
             }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Voice analyzed successfully",
+            analysis: {
+                id: analysis._id,
+                filename: analysis.filename,
+                status: analysis.status,
+                riskScore: analysis.riskScore,
+                verdict: analysis.verdict,
+                audioFeatures: analysis.audioFeatures
+            },
+            alertCreated: Boolean(alert)
         });
     } catch (error) {
         console.error("ANALYZE VOICE ERROR:", error);
 
-        if (!res.headersSent) {
-            return res.status(500).json({
-                success: false,
-                message: "Voice analysis failed"
+        if (analysis) {
+            analysis.status = "failed";
+
+            await analysis.save().catch((saveError) => {
+                console.error(
+                    "FAILED STATUS SAVE ERROR:",
+                    saveError
+                );
             });
         }
+
+        return res.status(500).json({
+            success: false,
+            message: "Voice analysis failed",
+            details: error.message
+        });
     }
 };
