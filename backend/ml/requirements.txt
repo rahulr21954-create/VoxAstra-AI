@@ -1,0 +1,9 @@
+joblib
+numpy
+pandas
+scikit-learn
+librosa
+soundfile
+sys
+json
+os
